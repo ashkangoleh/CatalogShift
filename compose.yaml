@@ -1,0 +1,286 @@
+name: hms-polaris-lakekeeper
+
+services:
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio_root}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-local_minio_password}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio_root}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-local_minio_password}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        mc mb --ignore-existing local/warehouse
+        mc anonymous set none local/warehouse
+
+  hms-db:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_DB: metastore
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_postgres_password}
+    volumes:
+      - hms-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hive -d metastore"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  hive-metastore:
+    build:
+      context: .
+      dockerfile: infra/hms/Dockerfile
+    depends_on:
+      hms-db:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio_root}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-local_minio_password}
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://hms-db:5432/metastore
+        -Djavax.jdo.option.ConnectionUserName=hive
+        -Djavax.jdo.option.ConnectionPassword=${POSTGRES_PASSWORD:-local_postgres_password}
+        -Dhive.metastore.warehouse.dir=file:///tmp/hive-warehouse
+    ports:
+      - "9083:9083"
+    healthcheck:
+      test: ["CMD", "bash", "-ec", "</dev/tcp/127.0.0.1/9083"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  polaris-db:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_DB: polaris
+      POSTGRES_USER: polaris
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_postgres_password}
+    volumes:
+      - polaris-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polaris -d polaris"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  polaris-bootstrap:
+    image: apache/polaris-admin-tool:1.7.0
+    depends_on:
+      polaris-db:
+        condition: service_healthy
+    environment:
+      POLARIS_PERSISTENCE_TYPE: relational-jdbc
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_DATABASE_TYPE: postgresql
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://polaris-db:5432/polaris
+      QUARKUS_DATASOURCE_USERNAME: polaris
+      QUARKUS_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-local_postgres_password}
+    command:
+      - bootstrap
+      - --realm=POLARIS
+      - --credential=POLARIS,${POLARIS_CLIENT_ID:-root},${POLARIS_CLIENT_SECRET:-local_polaris_secret}
+
+  polaris:
+    image: apache/polaris:1.7.0
+    depends_on:
+      polaris-bootstrap:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      POLARIS_PERSISTENCE_TYPE: relational-jdbc
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_DATABASE_TYPE: postgresql
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_MAX_RETRIES: 10
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://polaris-db:5432/polaris
+      QUARKUS_DATASOURCE_USERNAME: polaris
+      QUARKUS_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-local_postgres_password}
+      POLARIS_REALM_CONTEXT_REALMS: POLARIS
+      POLARIS_BOOTSTRAP_CREDENTIALS: POLARIS,${POLARIS_CLIENT_ID:-root},${POLARIS_CLIENT_SECRET:-local_polaris_secret}
+      QUARKUS_OTEL_SDK_DISABLED: "true"
+      QUARKUS_HTTP_CORS_ENABLED: "true"
+      QUARKUS_HTTP_CORS_ORIGINS: http://localhost:3030,http://127.0.0.1:3030
+      QUARKUS_HTTP_CORS_METHODS: GET,POST,PUT,DELETE,PATCH,OPTIONS
+      QUARKUS_HTTP_CORS_HEADERS: Accept,Authorization,Content-Type,Polaris-Realm,X-Request-ID
+      QUARKUS_HTTP_CORS_EXPOSED_HEADERS: Content-Disposition
+      QUARKUS_HTTP_CORS_ACCESS_CONTROL_ALLOW_CREDENTIALS: "true"
+      AWS_REGION: us-west-2
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio_root}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-local_minio_password}
+      polaris.features."ALLOW_SETTING_S3_ENDPOINTS": "true"
+      polaris.features."ALLOW_UNSTRUCTURED_TABLE_LOCATION": "true"
+      polaris.readiness.ignore-severe-issues: "true"
+    ports:
+      - "8181:8181"
+      - "8182:8182"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8182/q/health/ready"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 15s
+
+  polaris-setup:
+    image: python:3.12.11-alpine
+    depends_on:
+      polaris:
+        condition: service_healthy
+    environment:
+      POLARIS_CLIENT_ID: ${POLARIS_CLIENT_ID:-root}
+      POLARIS_CLIENT_SECRET: ${POLARIS_CLIENT_SECRET:-local_polaris_secret}
+    volumes:
+      - ./infra/polaris/setup.py:/setup.py:ro
+    command: ["python", "/setup.py"]
+
+  polaris-console:
+    profiles: ["ui"]
+    build:
+      context: .
+      dockerfile: infra/polaris-console/Dockerfile
+    image: hms-polaris-console:e5fea020aedc
+    depends_on:
+      polaris:
+        condition: service_healthy
+    environment:
+      VITE_POLARIS_API_URL: http://localhost:8181
+      VITE_POLARIS_REALM: POLARIS
+      VITE_POLARIS_PRINCIPAL_SCOPE: PRINCIPAL_ROLE:ALL
+      VITE_OAUTH_TOKEN_URL: http://localhost:8181/api/catalog/v1/oauth/tokens
+      VITE_POLARIS_REALM_HEADER_NAME: Polaris-Realm
+    ports:
+      - "3030:8080"
+
+  lakekeeper-db:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_DB: lakekeeper
+      POSTGRES_USER: lakekeeper
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_postgres_password}
+    volumes:
+      - lakekeeper-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lakekeeper -d lakekeeper"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:v0.13.1
+    depends_on:
+      lakekeeper-db:
+        condition: service_healthy
+    environment:
+      LAKEKEEPER__PG_ENCRYPTION_KEY: local-development-encryption-key
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:${POSTGRES_PASSWORD:-local_postgres_password}@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:${POSTGRES_PASSWORD:-local_postgres_password}@lakekeeper-db:5432/lakekeeper
+      RUST_LOG: info
+    command: ["migrate"]
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:v0.13.1
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEKEEPER__PG_ENCRYPTION_KEY: local-development-encryption-key
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:${POSTGRES_PASSWORD:-local_postgres_password}@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:${POSTGRES_PASSWORD:-local_postgres_password}@lakekeeper-db:5432/lakekeeper
+      RUST_LOG: info
+    command: ["serve"]
+    ports:
+      - "8183:8181"
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+
+  lakekeeper-setup:
+    image: python:3.12.11-alpine
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio_root}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-local_minio_password}
+    volumes:
+      - ./infra/lakekeeper/setup.py:/setup.py:ro
+    command: ["python", "/setup.py"]
+
+  spark:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: infra/spark/Dockerfile
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+      polaris-setup:
+        condition: service_completed_successfully
+      lakekeeper-setup:
+        condition: service_completed_successfully
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio_root}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-local_minio_password}
+      POLARIS_CLIENT_ID: ${POLARIS_CLIENT_ID:-root}
+      POLARIS_CLIENT_SECRET: ${POLARIS_CLIENT_SECRET:-local_polaris_secret}
+    volumes:
+      - ./scripts:/workspace/scripts:ro
+      - ./.state:/workspace/state
+
+  migrator:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: infra/migrator/Dockerfile
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+      polaris-setup:
+        condition: service_completed_successfully
+      lakekeeper-setup:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio_root}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-local_minio_password}
+      AWS_REGION: us-west-2
+      POLARIS_CLIENT_ID: ${POLARIS_CLIENT_ID:-root}
+      POLARIS_CLIENT_SECRET: ${POLARIS_CLIENT_SECRET:-local_polaris_secret}
+      MIGRATION_IDENTIFIERS_REGEX: ${MIGRATION_IDENTIFIERS_REGEX:-^demo\..*}
+      MIGRATION_MODE: ${MIGRATION_MODE:-register}
+    volumes:
+      - ./.state:/work
+
+volumes:
+  minio-data:
+  hms-db-data:
+  polaris-db-data:
+  lakekeeper-db-data:

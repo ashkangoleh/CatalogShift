@@ -1,0 +1,7 @@
+.git
+.github
+.state
+__pycache__
+.ruff_cache
+*.pyc
+*.log

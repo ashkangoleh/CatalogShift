@@ -1,0 +1,11 @@
+.env
+.state/
+__pycache__/
+.ruff_cache/
+*.py[cod]
+*.log
+.DS_Store
+dry_run.txt
+failed_identifiers.txt
+failed_to_delete_at_source.txt
+migration_output.txt
